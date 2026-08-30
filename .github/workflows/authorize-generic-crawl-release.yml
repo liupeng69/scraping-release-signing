@@ -1,0 +1,129 @@
+name: Authorize Generic Crawl Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact operator-staging candidate SHA
+        required: true
+        type: string
+      functional_target_sha256:
+        description: Exact functional-target descriptor SHA-256
+        required: true
+        type: string
+      functional_target_values_sha256:
+        description: Exact selected values SHA-256
+        required: true
+        type: string
+      image_inventory_sha256:
+        description: Exact seven-image inventory SHA-256
+        required: true
+        type: string
+      activation_receipt_sha256:
+        description: Exact Workload Plan activation receipt SHA-256
+        required: true
+        type: string
+      activation_bundle_sha256:
+        description: Exact published activation-bundle SHA-256
+        required: true
+        type: string
+      activation_expires_at_unix:
+        description: Exact activation expiry as Unix seconds
+        required: true
+        type: string
+      workload_apply_run_id:
+        description: Exact successful Workload Apply run ID
+        required: true
+        type: string
+      namespace_uid:
+        description: Exact namespace UID from Workload Apply receipt
+        required: true
+        type: string
+
+concurrency:
+  group: release-signing-generic-crawl-guardian-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the protected signer commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Verify current-cycle operator and immutable signer coordinates
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "liupeng69/scraping-release-signing"
+          test "$GITHUB_REPOSITORY_ID" = "1351773155"
+          test "$GITHUB_REPOSITORY_OWNER_ID" = "30068489"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$REF_PROTECTED" = "true"
+          test "$GITHUB_ACTOR" = "liupeng69"
+          test "$GITHUB_ACTOR_ID" = "30068489"
+          test "$GITHUB_TRIGGERING_ACTOR" = "liupeng69"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Create the exact short-lived guardian subject
+        id: subject
+        env:
+          ACTIVATION_BUNDLE_SHA256: ${{ inputs.activation_bundle_sha256 }}
+          ACTIVATION_EXPIRES_AT_UNIX: ${{ inputs.activation_expires_at_unix }}
+          ACTIVATION_RECEIPT_SHA256: ${{ inputs.activation_receipt_sha256 }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          FUNCTIONAL_TARGET_SHA256: ${{ inputs.functional_target_sha256 }}
+          FUNCTIONAL_TARGET_VALUES_SHA256: ${{ inputs.functional_target_values_sha256 }}
+          IMAGE_INVENTORY_SHA256: ${{ inputs.image_inventory_sha256 }}
+          NAMESPACE_UID: ${{ inputs.namespace_uid }}
+          WORKLOAD_APPLY_RUN_ID: ${{ inputs.workload_apply_run_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/release-signing-guardian"
+          install -d -m 0700 "$root"
+          python3 -I scripts/authority.py guardian \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --functional-target-sha256 "$FUNCTIONAL_TARGET_SHA256" \
+            --functional-target-values-sha256 "$FUNCTIONAL_TARGET_VALUES_SHA256" \
+            --image-inventory-sha256 "$IMAGE_INVENTORY_SHA256" \
+            --activation-receipt-sha256 "$ACTIVATION_RECEIPT_SHA256" \
+            --activation-bundle-sha256 "$ACTIVATION_BUNDLE_SHA256" \
+            --activation-expires-at-unix "$ACTIVATION_EXPIRES_AT_UNIX" \
+            --workload-apply-run-id "$WORKLOAD_APPLY_RUN_ID" \
+            --namespace-uid "$NAMESPACE_UID" \
+            --workflow-commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$root/generic-crawl-guardian-receipt.json" >/dev/null
+          subject_sha256="$(sha256sum "$root/generic-crawl-guardian-receipt.json" | awk '{print $1}')"
+          [[ "$subject_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$subject_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Keylessly attest the exact guardian subject
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: generic-crawl-guardian-receipt.json
+          subject-digest: sha256:${{ steps.subject.outputs.sha256 }}
+
+      - name: Upload only the attested guardian subject
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: operator-staging-generic-crawl-guardian-${{ inputs.candidate_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-signing-guardian/generic-crawl-guardian-receipt.json
+          if-no-files-found: error
+          retention-days: 7

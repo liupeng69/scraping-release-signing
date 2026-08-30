@@ -1,0 +1,237 @@
+name: Publish Generic Crawl Activation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact private operator-staging candidate SHA
+        required: true
+        type: string
+      functional_target_sha256:
+        description: SHA-256 of ops/staging/functional-target.json
+        required: true
+        type: string
+      functional_target_values_sha256:
+        description: SHA-256 of the selected target values file
+        required: true
+        type: string
+      hostile_network_proof_sha256:
+        description: Reviewed hostile-network proof SHA-256
+        required: true
+        type: string
+      evidence_lifecycle_proof_sha256:
+        description: Reviewed evidence-lifecycle proof SHA-256
+        required: true
+        type: string
+      provider_governance_proof_sha256:
+        description: Reviewed provider-governance proof SHA-256
+        required: true
+        type: string
+      durable_network_budget_proof_sha256:
+        description: Reviewed durable-network-budget proof SHA-256
+        required: true
+        type: string
+      real_postgres_execution_proof_sha256:
+        description: Reviewed real-PostgreSQL-execution proof SHA-256
+        required: true
+        type: string
+
+concurrency:
+  group: release-signing-generic-crawl-activation-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    environment: release-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the protected signer commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Verify current-cycle operator and immutable signer coordinates
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "liupeng69/scraping-release-signing"
+          test "$GITHUB_REPOSITORY_ID" = "1351773155"
+          test "$GITHUB_REPOSITORY_OWNER" = "liupeng69"
+          test "$GITHUB_REPOSITORY_OWNER_ID" = "30068489"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$REF_PROTECTED" = "true"
+          test "$GITHUB_ACTOR" = "liupeng69"
+          test "$GITHUB_ACTOR_ID" = "30068489"
+          test "$GITHUB_TRIGGERING_ACTOR" = "liupeng69"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Generate source-bound activation and independent outbound key
+        id: generate
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          DURABLE_NETWORK_BUDGET_PROOF_SHA256: ${{ inputs.durable_network_budget_proof_sha256 }}
+          EVIDENCE_LIFECYCLE_PROOF_SHA256: ${{ inputs.evidence_lifecycle_proof_sha256 }}
+          FUNCTIONAL_TARGET_SHA256: ${{ inputs.functional_target_sha256 }}
+          FUNCTIONAL_TARGET_VALUES_SHA256: ${{ inputs.functional_target_values_sha256 }}
+          HOSTILE_NETWORK_PROOF_SHA256: ${{ inputs.hostile_network_proof_sha256 }}
+          PROVIDER_GOVERNANCE_PROOF_SHA256: ${{ inputs.provider_governance_proof_sha256 }}
+          REAL_POSTGRES_EXECUTION_PROOF_SHA256: ${{ inputs.real_postgres_execution_proof_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/release-signing-activation"
+          install -d -m 0700 "$root"
+          python3 -I scripts/authority.py activation \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --functional-target-sha256 "$FUNCTIONAL_TARGET_SHA256" \
+            --functional-target-values-sha256 "$FUNCTIONAL_TARGET_VALUES_SHA256" \
+            --hostile-network-proof-sha256 "$HOSTILE_NETWORK_PROOF_SHA256" \
+            --evidence-lifecycle-proof-sha256 "$EVIDENCE_LIFECYCLE_PROOF_SHA256" \
+            --provider-governance-proof-sha256 "$PROVIDER_GOVERNANCE_PROOF_SHA256" \
+            --durable-network-budget-proof-sha256 "$DURABLE_NETWORK_BUDGET_PROOF_SHA256" \
+            --real-postgres-execution-proof-sha256 "$REAL_POSTGRES_EXECUTION_PROOF_SHA256" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output-dir "$root" >/dev/null
+          bundle_sha256="$(sha256sum "$root/activation-bundle.json" | awk '{print $1}')"
+          test "$bundle_sha256" = "$(jq -er .activation_bundle_sha256 "$root/activation-generation-receipt.json")"
+          echo "bundle_sha256=$bundle_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Configure exact activation-publisher credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37
+        with:
+          aws-region: us-west-2
+          role-to-assume: arn:aws:iam::116208987955:role/scraping-platform-staging-generic-crawl-activation-publisher
+          role-session-name: generic-crawl-activation-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Publish the independent key first and activation bundle last
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$RUNNER_TEMP/release-signing-activation"
+          observed_account="$(aws sts get-caller-identity --query Account --output text --no-cli-pager)"
+          test "$observed_account" = "116208987955"
+
+          publish_secret() {
+            local secret_name="$1"
+            local source_file="$2"
+            local description="$3"
+            local response_file="$4"
+            local describe_file="${response_file}.describe"
+            local error_file="${response_file}.error"
+            local token
+            token="$(sha256sum "$source_file" | awk '{print $1}')"
+            if aws secretsmanager describe-secret \
+              --region us-west-2 \
+              --secret-id "$secret_name" \
+              --no-cli-pager \
+              --output json >"$describe_file" 2>"$error_file"; then
+              test "$(jq -er .Name "$describe_file")" = "$secret_name"
+              aws secretsmanager put-secret-value \
+                --region us-west-2 \
+                --secret-id "$secret_name" \
+                --client-request-token "$token" \
+                --secret-string "file://${source_file}" \
+                --no-cli-pager \
+                --output json >"$response_file"
+            else
+              grep -Fq ResourceNotFoundException "$error_file"
+              aws secretsmanager create-secret \
+                --region us-west-2 \
+                --name "$secret_name" \
+                --description "$description" \
+                --client-request-token "$token" \
+                --secret-string "file://${source_file}" \
+                --tags \
+                  Key=Project,Value=scraping-platform \
+                  Key=Environment,Value=staging \
+                  Key=ManagedBy,Value=release-signing-authority \
+                  Key=CandidateSha,Value="$CANDIDATE_SHA" \
+                --no-cli-pager \
+                --output json >"$response_file"
+            fi
+            jq -e --arg name "$secret_name" '
+              .Name == $name and (.ARN | type == "string")
+              and (.VersionId | type == "string" and length >= 32)
+            ' "$response_file" >/dev/null
+          }
+
+          publish_secret \
+            scraping-platform/staging/nlp_outbound_network_capability_private_key_pem \
+            "$root/outbound-private-key.pem" \
+            "Candidate-bound outbound capability signer for generic crawl staging" \
+            "$root/outbound-publication.json"
+          publish_secret \
+            scraping-platform/staging/operator_staging_generic_crawl_activation_bundle \
+            "$root/activation-bundle.json" \
+            "Independently approved generic crawl activation bundle" \
+            "$root/activation-publication.json"
+
+          python3 -I - \
+            "$root/activation-generation-receipt.json" \
+            "$root/outbound-publication.json" \
+            "$root/activation-publication.json" \
+            "$root/activation-publication-receipt.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          generation = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="ascii"))
+          outbound = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          activation = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+          receipt = {
+              "schema_version": "scraping_release_signing_activation_publication.v1",
+              "candidate_sha": generation["candidate_sha"],
+              "activation_bundle_sha256": generation["activation_bundle_sha256"],
+              "activation_generation_receipt_sha256": hashlib.sha256(
+                  pathlib.Path(sys.argv[1]).read_bytes()
+              ).hexdigest(),
+              "activation_secret_version_id": activation["VersionId"],
+              "outbound_key_secret_version_id": outbound["VersionId"],
+              "activation_public_key_sha256": generation["activation_public_key_sha256"],
+              "outbound_capability_public_key_sha256": generation[
+                  "outbound_capability_public_key_sha256"
+              ],
+              "approved_at_unix": generation["approved_at_unix"],
+              "expires_at_unix": generation["expires_at_unix"],
+              "run_id": generation["run_id"],
+              "run_attempt": generation["run_attempt"],
+          }
+          canonical = lambda value: (json.dumps(
+              value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+          ) + "\n").encode("ascii")
+          receipt["receipt_sha256"] = hashlib.sha256(canonical(receipt)).hexdigest()
+          pathlib.Path(sys.argv[4]).write_text(
+              json.dumps(receipt, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+              encoding="ascii",
+          )
+          PY
+          rm -f \
+            "$root/activation-bundle.json" \
+            "$root/outbound-private-key.pem" \
+            "$root/outbound-publication.json" \
+            "$root/activation-publication.json" \
+            "$root/outbound-publication.json.describe" \
+            "$root/activation-publication.json.describe" \
+            "$root/outbound-publication.json.error" \
+            "$root/activation-publication.json.error"
+
+      - name: Upload only the redacted publication receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: generic-crawl-activation-${{ inputs.candidate_sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/release-signing-activation/activation-generation-receipt.json
+            ${{ runner.temp }}/release-signing-activation/activation-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
