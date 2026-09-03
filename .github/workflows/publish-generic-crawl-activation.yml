@@ -115,8 +115,6 @@ jobs:
           role-duration-seconds: 900
 
       - name: Publish the independent key first and activation bundle last
-        env:
-          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
           set -euo pipefail
           umask 077
@@ -139,6 +137,14 @@ jobs:
               --no-cli-pager \
               --output json >"$describe_file" 2>"$error_file"; then
               test "$(jq -er .Name "$describe_file")" = "$secret_name"
+              # Remove the one legacy candidate-scoped container tag before
+              # publishing a new immutable version. The IAM policy permits no
+              # other tag key or Secret ARN for this operation.
+              aws secretsmanager untag-resource \
+                --region us-west-2 \
+                --secret-id "$secret_name" \
+                --tag-keys CandidateSha \
+                --no-cli-pager
               aws secretsmanager put-secret-value \
                 --region us-west-2 \
                 --secret-id "$secret_name" \
@@ -148,6 +154,8 @@ jobs:
                 --output json >"$response_file"
             else
               grep -Fq ResourceNotFoundException "$error_file"
+              # These containers span candidates. Candidate identity belongs to
+              # the immutable version token and signed/redacted receipts.
               aws secretsmanager create-secret \
                 --region us-west-2 \
                 --name "$secret_name" \
@@ -158,7 +166,6 @@ jobs:
                   Key=Project,Value=scraping-platform \
                   Key=Environment,Value=staging \
                   Key=ManagedBy,Value=release-signing-authority \
-                  Key=CandidateSha,Value="$CANDIDATE_SHA" \
                 --no-cli-pager \
                 --output json >"$response_file"
             fi
@@ -171,7 +178,7 @@ jobs:
           publish_secret \
             scraping-platform/staging/nlp_outbound_network_capability_private_key_pem \
             "$root/outbound-private-key.pem" \
-            "Candidate-bound outbound capability signer for generic crawl staging" \
+            "Outbound capability signer for generic crawl staging" \
             "$root/outbound-publication.json"
           publish_secret \
             scraping-platform/staging/operator_staging_generic_crawl_activation_bundle \
@@ -234,4 +241,3 @@ jobs:
             ${{ runner.temp }}/release-signing-activation/activation-publication-receipt.json
           if-no-files-found: error
           retention-days: 30
-

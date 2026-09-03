@@ -10,9 +10,14 @@ import unittest
 
 
 _AUTHORITY_PATH = Path(__file__).resolve().parents[1] / "scripts" / "authority.py"
+_ACTIVATION_WORKFLOW_PATH = (
+    Path(__file__).resolve().parents[1]
+    / ".github/workflows/publish-generic-crawl-activation.yml"
+)
 _SPEC = importlib.util.spec_from_file_location("release_signing_authority", _AUTHORITY_PATH)
 if _SPEC is None or _SPEC.loader is None:
-    raise RuntimeError("authority module unavailable")
+    message = "authority module unavailable"
+    raise RuntimeError(message)
 authority = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(authority)
 
@@ -40,6 +45,21 @@ def _activation_args(tmp_path: Path) -> Namespace:
 
 
 class AuthorityTests(unittest.TestCase):
+    def test_activation_container_tags_are_stable_across_candidates(self) -> None:
+        workflow = _ACTIVATION_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("Key=CandidateSha", workflow)
+        self.assertIn("aws secretsmanager untag-resource", workflow)
+        self.assertIn("--tag-keys CandidateSha", workflow)
+        self.assertLess(
+            workflow.index("--tag-keys CandidateSha"),
+            workflow.index("aws secretsmanager put-secret-value"),
+        )
+        self.assertIn("Key=Project,Value=scraping-platform", workflow)
+        self.assertIn("Key=Environment,Value=staging", workflow)
+        self.assertIn("Key=ManagedBy,Value=release-signing-authority", workflow)
+        self.assertIn('--client-request-token "$token"', workflow)
+
     def test_activation_is_canonical_source_bound_and_key_separated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
