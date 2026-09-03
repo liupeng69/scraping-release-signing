@@ -56,6 +56,10 @@ def _reject(message: str) -> NoReturn:
     raise AuthorityError(message)
 
 
+def _reject_from(message: str, exc: Exception) -> NoReturn:
+    raise AuthorityError(message) from exc
+
+
 def _canonical(value: object, *, pretty: bool = False) -> bytes:
     options: dict[str, object] = {
         "allow_nan": False,
@@ -114,7 +118,7 @@ def _openssl(*arguments: str) -> None:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise AuthorityError("OpenSSL execution failed") from exc
+        _reject_from("OpenSSL execution failed", exc)
     if completed.returncode != 0:
         _reject("OpenSSL rejected the Ed25519 operation")
 
@@ -403,4 +407,3 @@ if __name__ == "__main__":
     except (AuthorityError, OSError, ValueError) as exc:
         print(f"release authority rejected: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
-
